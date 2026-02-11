@@ -1,0 +1,12 @@
+[package]
+name = "thermo-raw-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Thermo RAW file reader CLI"
+
+[dependencies]
+thermo-raw = { path = "../thermo-raw" }
+cfb-reader = { path = "../cfb-reader" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }

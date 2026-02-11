@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cfb-reader",
+    "crates/thermo-raw",
+    "crates/thermo-raw-cli",
+    "crates/thermo-raw-py",
+    "tools/hex-analyzer",
+]
+
+[workspace.dependencies]
+memmap2 = "0.9"
+rayon = "1.10"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+byteorder = "1"
+anyhow = "1"

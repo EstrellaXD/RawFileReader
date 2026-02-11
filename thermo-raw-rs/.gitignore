@@ -1,0 +1,10 @@
+/target
+**/*.raw
+test-data/raw-files/*
+!test-data/raw-files/.gitkeep
+test-data/ground-truth/*
+!test-data/ground-truth/.gitkeep
+decompiled/
+*.pyc
+__pycache__/
+.DS_Store

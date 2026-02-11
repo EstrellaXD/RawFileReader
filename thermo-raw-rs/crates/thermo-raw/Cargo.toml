@@ -1,0 +1,14 @@
+[package]
+name = "thermo-raw"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust Thermo RAW file reader"
+
+[dependencies]
+cfb-reader = { path = "../cfb-reader" }
+memmap2 = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+byteorder = { workspace = true }
