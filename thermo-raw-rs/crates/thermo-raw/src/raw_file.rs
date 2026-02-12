@@ -6,10 +6,11 @@ use crate::metadata;
 use crate::raw_file_info::RawFileInfo;
 use crate::run_header::RunHeader;
 use crate::scan_data;
+use crate::scan_event::{self, ScanEvent};
 use crate::scan_filter;
 use crate::scan_index::{self, ScanIndexEntry};
 use crate::trailer::{self, TrailerLayout};
-use crate::types::{Chromatogram, FileMetadata, MsLevel, Polarity, PrecursorInfo, Scan};
+use crate::types::{Chromatogram, FileMetadata, MsLevel, PrecursorInfo, Scan};
 use crate::version;
 use crate::RawError;
 use std::collections::HashMap;
@@ -48,6 +49,8 @@ pub struct RawFile {
     data_addr: u64,
     /// Pre-computed trailer layout (eagerly parsed on open).
     trailer_layout: Option<TrailerLayout>,
+    /// Parsed scan events (unique event templates, indexed by scan_event field).
+    scan_events: Vec<ScanEvent>,
 }
 
 impl RawFile {
@@ -115,6 +118,15 @@ impl RawFile {
             None
         };
 
+        // Parse scan events from scan_params stream (provides MS metadata
+        // as fallback when trailer filter text is unavailable).
+        let scan_params_addr = run_header.scan_params_addr();
+        let scan_events = if scan_params_addr > 0 {
+            scan_event::parse_scan_events(&data, scan_params_addr, ver).unwrap_or_default()
+        } else {
+            vec![]
+        };
+
         Ok(Self {
             data,
             version: ver,
@@ -123,6 +135,7 @@ impl RawFile {
             scan_index: scan_index_entries,
             data_addr,
             trailer_layout,
+            scan_events,
         })
     }
 
@@ -225,6 +238,9 @@ impl RawFile {
     }
 
     /// Extracted ion chromatogram for a target m/z with tolerance in ppm.
+    ///
+    /// Uses scan index m/z ranges to skip scans that cannot contain the target,
+    /// avoiding expensive scan data decoding for irrelevant scans.
     pub fn xic(&self, target_mz: f64, tolerance_ppm: f64) -> Result<Chromatogram, RawError> {
         use rayon::prelude::*;
         let half_width = target_mz * tolerance_ppm * 1e-6;
@@ -236,22 +252,18 @@ impl RawFile {
             .par_iter()
             .enumerate()
             .map(|(idx, entry)| {
+                // Pre-filter: skip scans whose m/z range doesn't overlap the target
+                if entry.low_mz > 0.0 && entry.high_mz > 0.0 {
+                    if entry.high_mz < low || entry.low_mz > high {
+                        return (entry.rt, 0.0);
+                    }
+                }
+
                 let scan_num = self.run_header.first_scan + idx as u32;
-                let scan = self.scan(scan_num).unwrap_or_else(|_| Scan {
-                    scan_number: scan_num,
-                    rt: entry.rt,
-                    ms_level: MsLevel::Ms1,
-                    polarity: Polarity::Unknown,
-                    tic: 0.0,
-                    base_peak_mz: 0.0,
-                    base_peak_intensity: 0.0,
-                    centroid_mz: vec![],
-                    centroid_intensity: vec![],
-                    profile_mz: None,
-                    profile_intensity: None,
-                    precursor: None,
-                    filter_string: None,
-                });
+                let scan = match self.scan(scan_num) {
+                    Ok(s) => s,
+                    Err(_) => return (entry.rt, 0.0),
+                };
                 let intensity: f64 = scan
                     .centroid_mz
                     .iter()
@@ -299,6 +311,11 @@ impl RawFile {
         &self.scan_index
     }
 
+    /// Get the parsed scan events.
+    pub fn scan_events(&self) -> &[ScanEvent] {
+        &self.scan_events
+    }
+
     /// List OLE2 streams in the file (uses cfb-reader).
     pub fn list_streams(path: impl AsRef<Path>) -> Result<Vec<String>, RawError> {
         let container = cfb_reader::Ole2Container::open(path)
@@ -311,27 +328,63 @@ impl RawFile {
     /// Extracts filter string from trailer extra, parses it for MS level and
     /// polarity, and builds precursor info for MS2+ scans from both the filter
     /// string and dedicated trailer fields (Monoisotopic M/Z, Charge State).
+    ///
+    /// Falls back to ScanEvent preamble data when trailer filter text is unavailable.
     fn enrich_scan(&self, scan: &mut Scan, scan_idx: u32) {
-        let layout = match &self.trailer_layout {
-            Some(l) => l,
-            None => return,
-        };
+        // Try trailer-based enrichment first (most accurate)
+        let mut enriched_from_trailer = false;
+        if let Some(layout) = &self.trailer_layout {
+            if let Some(fi) = layout.filter_text_idx {
+                if let Ok(filter_str) = layout.read_string(&self.data, scan_idx, fi) {
+                    if !filter_str.is_empty() {
+                        let filter = scan_filter::parse_filter(&filter_str);
+                        scan.ms_level = filter.ms_level;
+                        scan.polarity = filter.polarity;
+                        scan.filter_string = Some(filter_str);
 
-        // Extract filter string from trailer
-        if let Some(fi) = layout.filter_text_idx {
-            if let Ok(filter_str) = layout.read_string(&self.data, scan_idx, fi) {
-                if !filter_str.is_empty() {
-                    let filter = scan_filter::parse_filter(&filter_str);
-                    scan.ms_level = filter.ms_level;
-                    scan.polarity = filter.polarity;
-                    scan.filter_string = Some(filter_str);
-
-                    // Build precursor info for MS2+ scans
-                    if !matches!(scan.ms_level, MsLevel::Ms1) {
-                        scan.precursor =
-                            self.build_precursor_info(layout, scan_idx, &filter);
+                        // Build precursor info for MS2+ scans
+                        if !matches!(scan.ms_level, MsLevel::Ms1) {
+                            scan.precursor =
+                                self.build_precursor_info(layout, scan_idx, &filter);
+                        }
+                        enriched_from_trailer = true;
                     }
                 }
+            }
+        }
+
+        // Fallback: use ScanEvent preamble for MS metadata
+        if !enriched_from_trailer {
+            self.enrich_from_scan_event(scan, scan_idx);
+        }
+    }
+
+    /// Enrich scan metadata from parsed ScanEvent (fallback when trailer unavailable).
+    fn enrich_from_scan_event(&self, scan: &mut Scan, scan_idx: u32) {
+        let entry = match self.scan_index.get(scan_idx as usize) {
+            Some(e) => e,
+            None => return,
+        };
+        let event = match self.scan_events.get(entry.scan_event as usize) {
+            Some(e) => e,
+            None => return,
+        };
+        let preamble = &event.preamble;
+
+        scan.ms_level = preamble.ms_level;
+        scan.polarity = preamble.polarity;
+
+        // Build precursor info from scan event reactions for MS2+ scans
+        if !matches!(scan.ms_level, MsLevel::Ms1) {
+            if let Some(reaction) = event.reactions.last() {
+                let activation_str = format!("{}", preamble.activation);
+                scan.precursor = Some(PrecursorInfo {
+                    mz: reaction.precursor_mz,
+                    charge: None, // Not available from scan event
+                    isolation_width: Some(reaction.isolation_width).filter(|&w| w > 0.0),
+                    activation_type: Some(activation_str),
+                    collision_energy: Some(reaction.collision_energy),
+                });
             }
         }
     }

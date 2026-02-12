@@ -1,5 +1,7 @@
+use serde::{Deserialize, Serialize};
+
 /// Mass spectrometry polarity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Polarity {
     Positive,
     Negative,
@@ -7,7 +9,7 @@ pub enum Polarity {
 }
 
 /// MS scan level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MsLevel {
     Ms1,
     Ms2,
@@ -16,7 +18,7 @@ pub enum MsLevel {
 }
 
 /// A single scan with all associated data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scan {
     pub scan_number: u32,
     /// Retention time in minutes.
@@ -35,7 +37,7 @@ pub struct Scan {
 }
 
 /// MS2+ precursor ion information.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecursorInfo {
     pub mz: f64,
     pub charge: Option<i32>,
@@ -45,7 +47,7 @@ pub struct PrecursorInfo {
 }
 
 /// A chromatogram (TIC, BPC, XIC, etc.).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chromatogram {
     /// Retention times in minutes.
     pub rt: Vec<f64>,
@@ -53,7 +55,7 @@ pub struct Chromatogram {
 }
 
 /// File-level metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {
     pub creation_date: String,
     pub instrument_model: String,

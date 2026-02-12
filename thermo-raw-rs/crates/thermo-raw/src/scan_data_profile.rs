@@ -16,6 +16,7 @@ use crate::RawError;
 /// Decode profile data from a scan data packet.
 ///
 /// Returns (mz_array, intensity_array) with one entry per bin across all chunks.
+/// Uses batch slice reads for signal data to minimize per-element overhead.
 pub fn decode_profile(
     data: &[u8],
     offset: usize,
@@ -58,14 +59,26 @@ pub fn decode_profile(
             None
         };
 
-        // Read signal values
-        for i in 0..chunk_nbins {
-            let signal = reader.read_f32()?;
-            let bin_index = first_bin + i;
+        // Batch read: get raw bytes for all signal values at once
+        let signal_bytes = chunk_nbins as usize * 4;
+        let raw_slice = reader.slice(signal_bytes)?;
+
+        for i in 0..chunk_nbins as usize {
+            let bytes = [
+                raw_slice[i * 4],
+                raw_slice[i * 4 + 1],
+                raw_slice[i * 4 + 2],
+                raw_slice[i * 4 + 3],
+            ];
+            let signal = f32::from_le_bytes(bytes);
+            let bin_index = first_bin as u64 + i as u64;
             let mz = first_value + (bin_index as f64) * step;
             mz_values.push(mz);
             intensities.push(signal as f64);
         }
+
+        // Advance reader past the signal data
+        reader.skip(signal_bytes)?;
     }
 
     Ok((mz_values, intensities))

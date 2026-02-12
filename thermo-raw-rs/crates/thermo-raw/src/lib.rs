@@ -31,6 +31,7 @@ pub mod run_header;
 pub mod scan_data;
 pub mod scan_data_centroid;
 pub mod scan_data_profile;
+pub mod scan_event;
 pub mod scan_filter;
 pub mod scan_index;
 pub mod trailer;
