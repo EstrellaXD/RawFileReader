@@ -1,6 +1,7 @@
 # Thermo RAW Binary Format Specification
 
-> **Sources**: unfinnigan (Gene Selkov), unthermo (Pieter Kelchtermans), Finnigan CPAN distribution.
+> **Sources**: Decompiled ThermoFisher.CommonCore.RawFileReader (v6.8.0.0),
+> unfinnigan (Gene Selkov), unthermo (Pieter Kelchtermans), Finnigan CPAN distribution.
 > Covers RAW file versions 57-66 (modern instruments: LTQ, Orbitrap, Q Exactive, Exploris).
 
 ## 1. Container Layer: OLE2/CFBF
@@ -37,22 +38,27 @@ All strings in the format are length-prefixed UTF-16LE:
 
 The first structure in the main data stream. Identifies the file and its version.
 
+From decompiled `FileHeader.cs` and `FileHeaderStruct`:
+
 | Offset | Type       | Size       | Field              | Notes                           |
 |--------|------------|------------|--------------------|---------------------------------|
-| 0      | u16        | 2          | magic              | Must be `0xA101`                |
-| 2      | UTF16LE    | 36 (18ch)  | signature          | Format signature string         |
+| 0      | u16        | 2          | magic              | Must be `0xA101` (FinnID)       |
+| 2      | UTF16LE    | 36 (18ch)  | signature          | Must be `"Finnigan"` (FinnSig)  |
 | 38     | u32        | 4          | unknown1           |                                 |
 | 42     | u32        | 4          | unknown2           |                                 |
 | 46     | u32        | 4          | unknown3           |                                 |
 | 50     | u32        | 4          | unknown4           |                                 |
-| 54     | u32        | 4          | **version**        | Key field: 8,47,57,60,62,63,64,66 |
-| 58     | AuditTag   | 112        | audit_start        | Creation timestamp + user       |
-| 170    | AuditTag   | 112        | audit_end          | Last modification               |
+| 54     | u32        | 4          | **version** (FileRev) | Key field: e.g. 57,60,62,63,64,65,66 |
+| 58     | AuditTag   | 112        | audit_start (Created)  | Creation timestamp + user       |
+| 170    | AuditTag   | 112        | audit_end (Changed)    | Last modification               |
 | 282    | u32        | 4          | unknown5           |                                 |
 | 286    | bytes      | 60         | unknown_area       |                                 |
-| 346    | UTF16LE    | 2056 (1028ch) | tag             | File description                |
+| 346    | UTF16LE    | 2056 (1028ch) | FileDescription  | File description text           |
 
 **Total FileHeader size**: ~2402 bytes (fixed).
+
+The current DLL writes version 66 by default. Files with version > 66 are considered
+"newer revision" by the DLL's `IsNewerRevision()` method.
 
 ### AuditTag (112 bytes)
 
@@ -62,151 +68,191 @@ The first structure in the main data stream. Identifies the file and its version
 | 8      | UTF16LE    | 100 (50ch) | tag1 (user)   |
 | 108    | u32        | 4          | unknown (possibly CRC) |
 
+### Checksum
+
+For version >= 57, the file header uses Adler32 checksum:
+- Seed: computed from the header struct bytes
+- Data: up to 10 MB of file data after the header
+- Stored in `FileHeaderStruct.CheckSum`
+
 ## 4. RawFileInfoPreamble
 
 Located after the FileHeader. Contains acquisition date and pointers to RunHeaders.
 
-| Offset | Type   | Size | Field                   |
-|--------|--------|------|-------------------------|
-| 0      | u32    | 4    | method_file_present     |
-| 4      | u16    | 2    | year                    |
-| 6      | u16    | 2    | month                   |
-| 8      | u16    | 2    | day_of_week             |
-| 10     | u16    | 2    | day                     |
-| 12     | u16    | 2    | hour                    |
-| 14     | u16    | 2    | minute                  |
-| 16     | u16    | 2    | second                  |
-| 18     | u16    | 2    | millisecond             |
+From decompiled `RawFileInfo.cs` and `RawFileInfoStruct*`:
 
-### Version 57-63 additional fields (after preamble):
+### Common preamble (all versions v25+):
 
-| Offset | Type   | Size | Field                   |
-|--------|--------|------|-------------------------|
-| 20     | u32    | 4    | unknown1                |
-| 24     | u32    | 4    | data_addr_32            |
-| 28     | u32    | 4    | n_controllers_1         |
-| 32     | u32    | 4    | n_controllers_2         |
-| 36     | u32    | 16   | unknown2..5             |
-| 52     | u32    | 4    | run_header_addr_32      |
-| 56     | u32    | 4    | run_header_addr2_32     |
-| 60     | bytes  | 744  | unknown_area            |
+| Offset | Type   | Size | Field                   | Notes |
+|--------|--------|------|-------------------------|-------|
+| 0      | i32    | 4    | IsExpMethodPresent      | bool marshalled as i32 |
+| 4      | u16x8  | 16   | SystemTimeStruct        | Win32 SYSTEMTIME (year,month,dow,day,hour,min,sec,ms) |
+| 20     | i32    | 4    | IsInAcquisition         | bool as i32 |
+| 24     | u32    | 4    | VirtualDataOffset32     | 32-bit data offset |
+| 28     | i32    | 4    | NumberOfVirtualControllers |  |
+| 32     | i32    | 4    | NextAvailableControllerIndex | |
 
-### Version 64-66 additional fields:
-
-Same 32-bit fields as above, plus 64-bit addresses:
+### OldVirtualControllerInfo[64] (all versions v25+):
 
 | Offset | Type   | Size | Field                   |
 |--------|--------|------|-------------------------|
-| ...    | u64    | 8    | data_addr_64            |
-| ...    | u64    | 8    | unknown_addr_64         |
-| ...    | u64[]  | 8 ea | run_header_addrs_64     |
-| ...    | bytes  | 992-1032 | unknown_area (version-dependent) |
+| 36     | struct | 768  | 64 entries x 12 bytes each |
 
-After the preamble, 5 heading strings follow as PascalStringWin32.
+Each OldVirtualControllerInfo (12 bytes):
+
+| Offset | Type | Size | Field |
+|--------|------|------|-------|
+| 0      | i32  | 4    | VirtualDeviceType (enum) |
+| 4      | i32  | 4    | VirtualDeviceIndex |
+| 8      | i32  | 4    | Offset (32-bit file pointer) |
+
+### Version 64+ additional fields (after OldVirtualControllerInfo[64]):
+
+| Offset  | Type   | Size | Field                   |
+|---------|--------|------|-------------------------|
+| 804     | i64    | 8    | VirtualDataOffset (64-bit) |
+| 812     | struct | 1024 | VirtualControllerInfoStruct[64] |
+
+Each VirtualControllerInfoStruct (16 bytes):
+
+| Offset | Type | Size | Field |
+|--------|------|------|-------|
+| 0      | i32  | 4    | VirtualDeviceType (enum) |
+| 4      | i32  | 4    | VirtualDeviceIndex |
+| 8      | i64  | 8    | Offset (64-bit file pointer) |
+
+### Version 65+ additional fields (after VirtualControllerInfoStruct[64]):
+
+| Offset  | Type | Size | Field       |
+|---------|------|------|-------------|
+| 1836    | i64  | 8    | BlobOffset  |
+| 1844    | u32  | 4    | BlobSize    |
+
+### After the struct: variable-length strings
+
+| Order | Type              | Field         |
+|-------|-------------------|---------------|
+| 1-5   | PascalStringWin32 | UserLabels[5] |
+| 6     | PascalStringWin32 | ComputerName (v7+) |
 
 ## 5. RunHeader
 
-The primary index structure for each instrument. Located at the address from RawFileInfo.
+The primary index structure for each instrument. Located at the address from
+the first VirtualControllerInfo's Offset field.
+
+From decompiled `RunHeader.cs` and `RunHeaderStruct*`:
 
 ### SampleInfo (nested at start of RunHeader)
 
-| Offset | Type   | Size | Field                   |
-|--------|--------|------|-------------------------|
-| 0      | u32    | 4    | unknown1                |
-| 4      | u32    | 4    | unknown2                |
-| 8      | u32    | 4    | **first_scan_number**   |
-| 12     | u32    | 4    | **last_scan_number**    |
-| 16     | u32    | 4    | inst_log_length         |
-| 20     | u32    | 4    | error_log_length        |
-| 24     | u32    | 4    | unknown3                |
-| 28     | u32    | 4    | scan_index_addr_32      |
-| 32     | u32    | 4    | data_addr_32            |
-| 36     | u32    | 4    | inst_log_addr_32        |
-| 40     | u32    | 4    | error_log_addr_32       |
-| 44     | u32    | 4    | unknown4                |
-| 48     | f64    | 8    | max_ion_current         |
-| 56     | f64    | 8    | **low_mz**              |
-| 64     | f64    | 8    | **high_mz**             |
-| 72     | f64    | 8    | **start_time** (minutes)|
-| 80     | f64    | 8    | **end_time** (minutes)  |
-| 88     | bytes  | 56   | unknown_area            |
-| 144    | UTF16  | 88 (44ch) | tag1 (sample text) |
-| 232    | UTF16  | 40 (20ch) | tag2              |
-| 272    | UTF16  | 320 (160ch) | tag3            |
+| Offset | Type   | Size | Field                   | Notes |
+|--------|--------|------|-------------------------|-------|
+| 0      | i16    | 2    | Revision                | Software revision level |
+| 2      | i32    | 4    | DataSetID               |  |
+| 6      | i32    | 4    | **FirstSpectrum**       |  |
+| 10     | i32    | 4    | **LastSpectrum**        |  |
+| 14     | i32    | 4    | NumStatusLog            |  |
+| 18     | i32    | 4    | NumErrorLog             |  |
+| 22     | i32    | 4    | FileFlag                |  |
+| 26     | i32    | 4    | SpectPos32Bit           | Scan index offset (32-bit) |
+| 30     | i32    | 4    | PacketPos32Bit          | Data stream offset (32-bit) |
+| 34     | i32    | 4    | StatusLogPos32Bit       |  |
+| 38     | i32    | 4    | ErrorLogPos32Bit        |  |
+| 42     | i16    | 2    | MaxPacket               |  |
+| 44     | f64    | 8    | MaxIntegIntensity       |  |
+| 52     | f64    | 8    | **LowMass**             |  |
+| 60     | f64    | 8    | **HighMass**            |  |
+| 68     | f64    | 8    | **StartTime** (minutes) |  |
+| 76     | f64    | 8    | **EndTime** (minutes)   |  |
 
-**SampleInfo total**: ~592 bytes.
+Followed by instrument metadata, 13 filename strings (each 260 UTF-16 chars = 520 bytes),
+and trailer/tune data positions (see RunHeaderStruct source for full layout).
 
-### RunHeader fields (after SampleInfo)
+### Version 49+ additional fields (RunHeaderStruct4):
 
-13 filename strings (each 520 bytes = 260 UTF-16 chars), followed by:
+| Field              | Type | Size |
+|--------------------|------|------|
+| ToleranceUnit      | i32  | 4    |
+| FilterMassPrecision| i32  | 4    |
 
-| Offset (relative) | Type | Size | Field                    |
-|--------------------|------|------|--------------------------|
-| after filenames    | f64  | 8    | unknown_double1          |
-| +8                 | f64  | 8    | unknown_double2          |
-| +16                | u32  | 4    | scan_trailer_addr_32     |
-| +20                | u32  | 4    | scan_params_addr_32      |
-| +24                | u32  | 8    | unknown_lengths          |
-| +32                | u32  | 4    | n_segments               |
-| +36                | u32  | 16   | unknown4..7              |
-| +52                | u32  | 4    | own_addr_32              |
+### Version 64+ additional fields (RunHeaderStruct5):
 
-### Version 64-66 extra fields (64-bit addresses):
+64-bit offset versions of all position fields:
 
-| Offset (relative) | Type | Size | Field                    |
-|--------------------|------|------|--------------------------|
-| ...                | u64  | 8    | **scan_index_addr_64**   |
-| ...                | u64  | 8    | **data_addr_64**         |
-| ...                | u64  | 8    | inst_log_addr_64         |
-| ...                | u64  | 8    | error_log_addr_64        |
-| ...                | u64  | 8    | unknown_addr1_64         |
-| ...                | u64  | 8    | **scan_trailer_addr_64** |
-| ...                | u64  | 8    | **scan_params_addr_64**  |
-| ...                | u32  | 8    | unknown5..6              |
-| ...                | u64  | 8    | own_addr_64              |
-| ...                | u32  | 96   | unknown7..30 (24 u32s)   |
+| Field                 | Type | Size |
+|-----------------------|------|------|
+| SpectPos              | i64  | 8    |
+| PacketPos             | i64  | 8    |
+| StatusLogPos          | i64  | 8    |
+| ErrorLogPos           | i64  | 8    |
+| RunHeaderPos          | i64  | 8    |
+| TrailerScanEventsPos  | i64  | 8    |
+| TrailerExtraPos       | i64  | 8    |
+| ControllerInfo        | VirtualControllerInfoStruct | 16 |
+| Extra0..5 Pos/Count   | (i64 + i32) x 6 | 72 |
 
-After fixed fields, PascalStringWin32 strings: device name, model, serial number,
-software version, tag1-tag4.
+### Version 66+ additional field (RunHeaderStruct):
+
+| Field          | Type | Size | Notes |
+|----------------|------|------|-------|
+| InstrumentType | i32  | 4    | Numeric instrument type identifier |
+
+After the fixed fields: PascalStringWin32 strings (device name, model, serial number,
+software version, tag1-tag4).
+
+For v<=63, 32-bit offsets are promoted to 64-bit via StructureConversion.ConvertFrom32Bit.
 
 ## 6. ScanIndex
 
-Array of `ScanIndexEntry`, one per scan. Located at `scan_index_addr`.
+Array of `ScanIndexEntry`, one per scan. Located at `SpectPos`/`SpectPos32Bit`.
 
-### ScanIndexEntry v57-63 (72 bytes)
+From decompiled `ScanIndices.cs` and `ScanIndexStruct*`:
 
-| Offset | Type  | Size | Field                |
-|--------|-------|------|----------------------|
-| 0      | u32   | 4    | offset_32            |
-| 4      | u32   | 4    | index (scan number)  |
-| 8      | u16   | 2    | scan_event           |
-| 10     | u16   | 2    | scan_segment         |
-| 12     | u32   | 4    | next                 |
-| 16     | u32   | 4    | unknown              |
-| 20     | u32   | 4    | **data_size**        |
-| 24     | f64   | 8    | **start_time** (RT)  |
-| 32     | f64   | 8    | **total_current** (TIC) |
-| 40     | f64   | 8    | **base_intensity**   |
-| 48     | f64   | 8    | **base_mz**          |
-| 56     | f64   | 8    | **low_mz**           |
-| 64     | f64   | 8    | **high_mz**          |
-
-### ScanIndexEntry v64 (80 bytes)
-
-Same as v57-63, plus:
+### ScanIndexEntry v<64: ScanIndexStruct1 (72 bytes)
 
 | Offset | Type  | Size | Field                |
 |--------|-------|------|----------------------|
-| 72     | u64   | 8    | **offset_64**        |
+| 0      | u32   | 4    | DataOffset32Bit      |
+| 4      | i32   | 4    | TrailerOffset        |
+| 8      | i32   | 4    | ScanTypeIndex (HIWORD=segment, LOWORD=scan type) |
+| 12     | i32   | 4    | ScanNumber           |
+| 16     | u32   | 4    | PacketType (HIWORD=SIScanData, LOWORD=scan type) |
+| 20     | i32   | 4    | NumberPackets        |
+| 24     | f64   | 8    | **StartTime** (RT)   |
+| 32     | f64   | 8    | **TIC**              |
+| 40     | f64   | 8    | **BasePeakIntensity**|
+| 48     | f64   | 8    | **BasePeakMass**     |
+| 56     | f64   | 8    | **LowMass**          |
+| 64     | f64   | 8    | **HighMass**         |
 
-### ScanIndexEntry v66 (88 bytes)
+### ScanIndexEntry v64: ScanIndexStruct2 (80 bytes)
 
-Same as v64, plus:
+Same as v<64, plus:
 
 | Offset | Type  | Size | Field                |
 |--------|-------|------|----------------------|
-| 80     | u32   | 4    | unknown1             |
-| 84     | u32   | 4    | unknown2             |
+| 72     | i64   | 8    | **DataOffset** (64-bit) |
+
+Note: `DataOffset32Bit` at offset 0 exists but is ignored; `DataSize` is set to 0.
+
+### ScanIndexEntry v65+: ScanIndexStruct (88 bytes)
+
+| Offset | Type  | Size | Field                |
+|--------|-------|------|----------------------|
+| 0      | u32   | 4    | **DataSize** (replaces DataOffset32Bit) |
+| 4      | i32   | 4    | TrailerOffset        |
+| 8      | i32   | 4    | ScanTypeIndex        |
+| 12     | i32   | 4    | ScanNumber           |
+| 16     | u32   | 4    | PacketType           |
+| 20     | i32   | 4    | NumberPackets        |
+| 24     | f64   | 8    | StartTime            |
+| 32     | f64   | 8    | TIC                  |
+| 40     | f64   | 8    | BasePeakIntensity    |
+| 48     | f64   | 8    | BasePeakMass         |
+| 56     | f64   | 8    | LowMass              |
+| 64     | f64   | 8    | HighMass             |
+| 72     | i64   | 8    | **DataOffset** (64-bit) |
+| 80     | i32   | 4    | **CycleNumber** (scan event cycle association) |
+| 84     | --    | 4    | (struct alignment padding) |
 
 ## 7. ScanDataPacket
 
@@ -296,53 +342,127 @@ Peaks stored as interleaved (mz, intensity) pairs, each f32.
 
 Describes acquisition parameters for each scan type.
 
+From decompiled `ScanEvent.cs` and `ScanEventInfoStruct*`:
+
+### ScanEvent stream layout
+
+The scan event stream (at `TrailerExtraPos`) starts with a u32 count,
+followed by that many ScanEvent structures. Each ScanEvent is:
+
+1. **ScanEventInfoStruct** (preamble, version-dependent fixed size)
+2. **Reactions array**: u32 count + count * MsReactionStruct
+3. **MassRanges**: u32 count + count * (f64 low, f64 high)
+4. **MassCalibrators**: u32 count + count * f64 (Hz-to-m/z coefficients)
+5. **SourceFragmentations**: u32 count + count * f64
+6. **SourceFragmentationMassRanges**: u32 count + count * (f64, f64)
+7. **Name**: PascalStringWin32 (v65+ only)
+
 ### ScanEventPreamble size by version:
 
-| Version  | Size (bytes) |
-|----------|-------------|
-| < 57     | 41          |
-| 57-60    | 80          |
-| 62       | 120         |
-| 63-64    | 128         |
-| 66       | 132         |
+From decompiled `ScanEvent.ReadStructure`:
 
-### Key byte positions in ScanEventPreamble:
+| Version  | Struct                | Size (bytes) |
+|----------|----------------------|-------------|
+| v<30     | ScanEventInfoStruct2 | ~20 (custom read) |
+| v30-47   | ScanEventInfoStruct3 | ~25 |
+| v48-50   | ScanEventInfoStruct50| ~28 |
+| v51-53   | ScanEventInfoStruct51| ~32 |
+| v54-61   | ScanEventInfoStruct54| 80  |
+| v62      | ScanEventInfoStruct62| 120 |
+| v63-64   | ScanEventInfoStruct63| 128 |
+| v65+     | ScanEventInfoStruct  | 132 |
+
+### Key byte positions in ScanEventPreamble (all versions):
 
 | Byte | Field          | Values                                              |
 |------|----------------|-----------------------------------------------------|
-| 4    | polarity       | 0=negative, 1=positive, 2=undefined                 |
-| 5    | scan_mode      | 0=centroid, 1=profile, 2=undefined                  |
-| 6    | ms_power       | 0=undef, 1=MS1, 2=MS2, ..., 8=MS8                  |
-| 7    | scan_type      | 0=Full, 1=Zoom, 2=SIM, 3=SRM, 4=CRM                |
-| 10   | dependent      | 0=primary, 1=dependent (DDA)                        |
-| 11   | ionization     | 0=EI,1=CI,2=FABI,3=ESI,4=APCI,5=NSI,6=TSI,7=FDI,8=MALDI |
-| 24   | activation     | 1=HCD, 4=CID                                       |
-| 40   | analyzer       | 0=ITMS, 1=TQMS, 2=SQMS, 3=TOFMS, 4=FTMS, 5=Sector |
+| 0    | IsValid        | Validity flag                                       |
+| 1    | IsCustom       | Custom scan flag                                    |
+| 2    | Corona         | Corona discharge state                              |
+| 3    | Detector       | Detector type                                       |
+| 4    | Polarity       | 0=negative, 1=positive, 2=undefined                 |
+| 5    | ScanDataType   | 0=centroid, 1=profile, 2=undefined                  |
+| 6    | MSOrder        | 0=undef, 1=MS1, 2=MS2, ..., 8=MS8 (sbyte in v65+)  |
+| 7    | ScanType       | 0=Full, 1=Zoom, 2=SIM, 3=SRM, 4=CRM                |
+| 8    | SourceFrag     | Source fragmentation state                          |
+| 9    | TurboScan      | Turbo scan state                                    |
+| 10   | DependentData  | 0=primary, 1=dependent (DDA)                        |
+| 11   | IonizationMode | 0=EI,1=CI,2=FAB,3=ESI,4=APCI,5=NSI,6=TSI,7=FDI,8=MALDI |
+| 24   | SourceFragType | Source fragmentation type (NOT activation type)     |
+| 40   | MassAnalyzer   | 0=ITMS,1=TQMS,2=SQMS,3=TOFMS,4=FTMS,5=Sector (v54+) |
 
-### ScanEvent (after preamble):
+### v65+ new preamble fields:
 
-| Field                  | Type         | Size      | Notes                        |
-|------------------------|-------------|-----------|------------------------------|
-| n_precursors           | u32         | 4         | Number of Reaction entries   |
-| reactions[0..n-1]      | Reaction[]  | 32 each   | Precursor info               |
-| unknown1               | u32         | 4         |                              |
-| fraction_collector     | (f64, f64)  | 16        | (low_mz, high_mz)           |
-| n_conversion_params    | u32         | 4         | 0, 4 (LTQ-FT), or 7 (Orbitrap) |
-| conversion_params[]    | f64[]       | 8 each    | Hz-to-m/z coefficients       |
+- `UpperCaseFilterFlags` (at offset 12, within existing padding before DetectorValue)
+- `LowerFlags` (ushort, at offset 25-26, within existing padding before ScanTypeIndex)
+- `Multiplex`, `ParamA`, `ParamB`, `ParamF`, `SpsMultiNotch`, `ParamR`, `ParamV` (bytes, at end)
 
-### Reaction (32 bytes)
+### Reaction (MsReactionStruct)
+
+From decompiled `Reaction.cs` and `MsReactionStruct*`:
+
+#### MsReactionStruct1 (24 bytes, v<31):
 
 | Offset | Type  | Size | Field              |
 |--------|-------|------|--------------------|
-| 0      | f64   | 8    | precursor_mz       |
-| 8      | f64   | 8    | unknown             |
-| 16     | f64   | 8    | collision_energy    |
-| 24     | u32   | 4    | unknown1            |
-| 28     | u32   | 4    | unknown2            |
+| 0      | f64   | 8    | PrecursorMass      |
+| 8      | f64   | 8    | IsolationWidth     |
+| 16     | f64   | 8    | CollisionEnergy    |
 
-## 9. Trailer Extra (Self-Describing Records)
+#### MsReactionStruct2 (32 bytes with padding, v31-64):
 
-Located at `scan_trailer_addr`. Uses a metadata-driven approach.
+| Offset | Type  | Size | Field              |
+|--------|-------|------|--------------------|
+| 0      | f64   | 8    | PrecursorMass      |
+| 8      | f64   | 8    | IsolationWidth     |
+| 16     | f64   | 8    | CollisionEnergy    |
+| 24     | u32   | 4    | CollisionEnergyValid |
+| 28     | --    | 4    | (struct alignment padding) |
+
+`CollisionEnergyValid` encoding:
+- Bit 0: valid flag
+- Bits 1-8 (0xFFE >> 1): ActivationType enum (0=CID, 1=HCD, 2=ETD, 3=ECD, ...)
+- Bit 12 (0x1000): multiple activation flag
+
+#### MsReactionStruct3 (48 bytes, v65):
+
+| Offset | Type  | Size | Field              |
+|--------|-------|------|--------------------|
+| 0      | f64   | 8    | PrecursorMass      |
+| 8      | f64   | 8    | IsolationWidth     |
+| 16     | f64   | 8    | CollisionEnergy    |
+| 24     | u32   | 4    | CollisionEnergyValid |
+| 28     | i32   | 4    | RangeIsValid (bool)|
+| 32     | f64   | 8    | FirstPrecursorMass |
+| 40     | f64   | 8    | LastPrecursorMass  |
+
+#### MsReactionStruct (56 bytes, v66+):
+
+| Offset | Type  | Size | Field              |
+|--------|-------|------|--------------------|
+| 0-47   | ...   | 48   | (same as v65)      |
+| 48     | f64   | 8    | IsolationWidthOffset |
+
+## 9. Filter (scan filter)
+
+From decompiled `Filter.cs`:
+
+Filter is read after preamble (via `Utilities.ReadStructure`) and contains:
+1. **FilterInfoStruct** (version-dependent fixed-size struct)
+2. **Masses**: u32 count + count * f64
+3. **MassRanges**: u32 count + count * (f64, f64)
+4. **SourceFragmentations** (v25+): u32 count + count * f64
+5. **SourceFragmentationMassRanges** (v25+): u32 count + count * (f64, f64)
+6. **PrecursorEnergies** (v31+): u32 count + count * f64
+7. **PrecursorEnergiesValid** (v31+): u32 count + count * u32
+8. **SourceFragmentationInfoValid** (v31+): u32 count + count * i32
+9. **Name** (v65+): PascalStringWin32
+10. **PrecursorMassRanges** (v65+): u32 count + count * (f64, f64)
+11. **PrecursorMassRangesValid** (v65+): u32 count + count * u32
+
+## 10. Trailer Extra (Self-Describing Records)
+
+Located at `TrailerScanEventsPos`/`TrailerScanEventsPos32Bit`. Uses a metadata-driven approach.
 
 ### GenericDataHeader
 
@@ -381,7 +501,7 @@ After the header, each scan has a record with fields matching the header descrip
 Common labels include: `"Charge State:"`, `"Monoisotopic M/Z:"`,
 `"Ion Injection Time (ms):"`, `"Elapsed Scan Time (sec):"`, etc.
 
-## 10. Overall File Layout (Reading Sequence)
+## 11. Overall File Layout (Reading Sequence)
 
 ```
 [OLE2 Header: 512 bytes, magic d0 cf 11 e0 a1 b1 1a e1]
@@ -392,23 +512,30 @@ Within the main data stream:
   [after header]   SequencerRow (optional)
   [...]            AutoSamplerInfo (optional)
   [...]            RawFileInfoPreamble + heading strings
-                     -> run_header_addr (absolute offset)
+                     -> VirtualControllerInfo[0].Offset = run_header_addr
   [run_header_addr] RunHeader
                      -> SampleInfo (first/last scan, time range, mass range)
-                     -> scan_index_addr, data_addr, scan_trailer_addr, etc.
-  [scan_index_addr] ScanIndexEntry[first_scan..last_scan]
+                     -> SpectPos, PacketPos, TrailerScanEventsPos, TrailerExtraPos
+  [SpectPos]       ScanIndexEntry[first_scan..last_scan]
                      -> per-scan: offset, RT, TIC, base peak, data size
-  [data_addr+off]  ScanDataPacket (per scan)
+  [PacketPos+off]  ScanDataPacket (per scan)
                      -> PacketHeader -> Profile -> PeakList -> Descriptors
-  [trailer_addr]   GenericDataHeader (template)
-                   GenericRecord[first_scan..last_scan]
+  [TrailerScanEventsPos] GenericDataHeader (template)
+                         GenericRecord[first_scan..last_scan]
+  [TrailerExtraPos]      ScanEvent[n_events] (unique event templates)
 ```
 
-## 11. Version Differences Summary
+## 12. Version Differences Summary
 
-| Feature              | v57-63   | v64       | v66       |
-|----------------------|----------|-----------|-----------|
-| Preamble size        | 80 bytes | 128 bytes | 132 bytes |
-| Address width        | 32-bit   | **64-bit**| **64-bit**|
-| ScanIndexEntry size  | 72 bytes | 80 bytes  | 88 bytes  |
-| Extra index fields   | None     | offset_64 | offset_64 + 2 unknowns |
+| Feature              | v57-63   | v64       | v65       | v66       |
+|----------------------|----------|-----------|-----------|-----------|
+| Address width        | 32-bit   | **64-bit**| 64-bit    | 64-bit    |
+| ScanIndexEntry size  | 72 bytes | 80 bytes  | **88 bytes** | 88 bytes |
+| ScanIndex CycleNumber| No       | No        | **Yes**   | Yes       |
+| ScanIndex DataSize   | No       | No        | **Yes**   | Yes       |
+| Preamble size        | 80 bytes | 128 bytes | **132 bytes** | 132 bytes |
+| Reaction size        | 32 bytes | 32 bytes  | **48 bytes** | **56 bytes** |
+| ScanEvent Name       | No       | No        | **Yes**   | Yes       |
+| RunHeader InstrType  | No       | No        | No        | **Yes**   |
+| RawFileInfo Blob     | No       | No        | **Yes**   | Yes       |
+| VirtualCtlInfoStruct | No       | **Yes**   | Yes       | Yes       |

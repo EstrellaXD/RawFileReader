@@ -3,6 +3,21 @@
 //! ScanEvents describe acquisition parameters for each scan type.
 //! The scan event stream at `scan_params_addr` contains unique event templates,
 //! each with a version-dependent preamble and variable-length reaction/conversion data.
+//!
+//! From decompiled ScanEvent.Load, the per-event layout is:
+//!   1. ScanEventInfoStruct (preamble, version-dependent fixed size)
+//!   2. Reactions array: u32 count + count * Reaction (version-dependent size per entry)
+//!   3. MassRanges: u32 count + count * (f64 low, f64 high)
+//!   4. MassCalibrators: u32 count + count * f64 (conversion params)
+//!   5. SourceFragmentations: u32 count + count * f64
+//!   6. SourceFragmentationMassRanges: u32 count + count * (f64, f64)
+//!   7. Name: PascalStringWin32 (v65+ only)
+//!
+//! Reaction sizes (from decompiled Reaction.Load):
+//!   - v66:    56 bytes (MsReactionStruct: adds IsolationWidthOffset)
+//!   - v65:    48 bytes (MsReactionStruct3: adds RangeIsValid, First/LastPrecursorMass)
+//!   - v31-64: 32 bytes (MsReactionStruct2: PrecursorMass, IsolationWidth, CollisionEnergy, CollisionEnergyValid)
+//!   - v<31:   24 bytes (MsReactionStruct1: PrecursorMass, IsolationWidth, CollisionEnergy)
 
 use crate::io_utils::BinaryReader;
 use crate::types::{MsLevel, Polarity};
@@ -98,18 +113,64 @@ pub struct ScanEvent {
     pub conversion_params: Vec<f64>,
 }
 
-/// Reaction (precursor fragmentation info, 32 bytes each).
+/// Reaction (precursor fragmentation info).
+///
+/// From decompiled MsReactionStruct layout:
+/// - PrecursorMass (f64, offset 0)
+/// - IsolationWidth (f64, offset 8)
+/// - CollisionEnergy (f64, offset 16)
+/// - CollisionEnergyValid (u32, offset 24) - bit 0: valid flag, bits 1-8: ActivationType enum
+/// - RangeIsValid (i32, offset 28) - v65+ only
+/// - FirstPrecursorMass (f64, offset 32) - v65+ only
+/// - LastPrecursorMass (f64, offset 40) - v65+ only
+/// - IsolationWidthOffset (f64, offset 48) - v66+ only
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reaction {
     pub precursor_mz: f64,
     pub isolation_width: f64,
     pub collision_energy: f64,
+    /// Collision energy valid flag (bit 0), activation type enum (bits 1-8).
+    pub collision_energy_valid: u32,
+    /// Whether first/last precursor mass range is valid (v65+ only).
+    pub precursor_range_valid: bool,
+    /// First precursor mass of isolation range (v65+ only).
+    pub first_precursor_mass: f64,
+    /// Last precursor mass of isolation range (v65+ only).
+    pub last_precursor_mass: f64,
+    /// Isolation width offset (v66+ only).
+    pub isolation_width_offset: f64,
+}
+
+impl Reaction {
+    /// Derive the activation type from the CollisionEnergyValid field.
+    pub fn activation_type(&self) -> ActivationType {
+        if self.collision_energy_valid == 0 {
+            return ActivationType::Cid; // default
+        }
+        let type_bits = ((self.collision_energy_valid >> 1) & 0xFF) as u8;
+        match type_bits {
+            0 => ActivationType::Cid,
+            1 => ActivationType::Hcd,
+            2 => ActivationType::Etd,
+            3 => ActivationType::Ecd,
+            n => ActivationType::Unknown(n),
+        }
+    }
 }
 
 /// Parse the ScanEventPreamble from raw bytes.
 ///
 /// The preamble is a fixed-size block at the start of each ScanEvent.
 /// Key fields are at well-known byte positions within the preamble.
+///
+/// From decompiled ScanEventInfoStruct field layout (all versions):
+/// - byte 4:  Polarity
+/// - byte 5:  ScanDataType (centroid/profile)
+/// - byte 6:  MSOrder
+/// - byte 7:  ScanType
+/// - byte 10: DependentData
+/// - byte 11: IonizationMode
+/// - byte 40: MassAnalyzerType (v54+, offset 40 for all versions due to field padding)
 fn parse_preamble(data: &[u8]) -> ScanEventPreamble {
     let polarity = if data.len() > 4 {
         match data[4] {
@@ -178,17 +239,11 @@ fn parse_preamble(data: &[u8]) -> ScanEventPreamble {
         IonizationType::Unknown(255)
     };
 
-    let activation = if data.len() > 24 {
-        match data[24] {
-            0 => ActivationType::Cid,
-            1 => ActivationType::Hcd,
-            2 => ActivationType::Etd,
-            3 => ActivationType::Ecd,
-            n => ActivationType::Unknown(n),
-        }
-    } else {
-        ActivationType::Unknown(255)
-    };
+    // Activation type: derived from reactions (CollisionEnergyValid field).
+    // Byte 24 in the preamble is SourceFragmentationType (source CID type), not
+    // the MS/MS activation type. We set a default here and let the caller
+    // override from Reaction data when available.
+    let activation = ActivationType::Unknown(255);
 
     let analyzer = if data.len() > 40 {
         match data[40] {
@@ -216,22 +271,116 @@ fn parse_preamble(data: &[u8]) -> ScanEventPreamble {
     }
 }
 
+/// Read a "doubles array": u32 count followed by count f64 values.
+/// Matches the decompiled ReadDoublesExt pattern.
+fn read_doubles_array(reader: &mut BinaryReader) -> Result<Vec<f64>, RawError> {
+    let count = reader.read_u32()?;
+    if count > 10_000 {
+        return Err(RawError::CorruptedData(format!(
+            "Unreasonable doubles array count: {}",
+            count
+        )));
+    }
+    reader.read_f64_array(count as usize)
+}
+
+/// Read a "mass range array": u32 count followed by count * (f64, f64) pairs.
+/// Matches the decompiled MassRangeStruct.LoadArray pattern.
+fn read_mass_range_array(reader: &mut BinaryReader) -> Result<Vec<(f64, f64)>, RawError> {
+    let count = reader.read_u32()?;
+    if count > 10_000 {
+        return Err(RawError::CorruptedData(format!(
+            "Unreasonable mass range count: {}",
+            count
+        )));
+    }
+    let mut ranges = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let low = reader.read_f64()?;
+        let high = reader.read_f64()?;
+        ranges.push((low, high));
+    }
+    Ok(ranges)
+}
+
+/// Parse a single Reaction from the data stream.
+///
+/// Reads version-dependent number of bytes per the decompiled Reaction.Load:
+/// - v66:    56 bytes (full MsReactionStruct)
+/// - v65:    48 bytes (MsReactionStruct3)
+/// - v31-64: 32 bytes (MsReactionStruct2)
+/// - v<31:   24 bytes (MsReactionStruct1)
+fn parse_reaction(reader: &mut BinaryReader, ver: u32) -> Result<Reaction, RawError> {
+    let rxn_size = version::reaction_size(ver);
+    let start = reader.position();
+
+    // Common fields (all versions): PrecursorMass, IsolationWidth, CollisionEnergy
+    let precursor_mz = reader.read_f64()?;
+    let isolation_width = reader.read_f64()?;
+    let collision_energy = reader.read_f64()?;
+
+    // CollisionEnergyValid (v31+)
+    let collision_energy_valid = if ver >= 31 {
+        reader.read_u32()?
+    } else {
+        1 // default: valid, CID
+    };
+
+    // RangeIsValid + First/LastPrecursorMass (v65+)
+    let (precursor_range_valid, first_precursor_mass, last_precursor_mass) = if ver >= 65 {
+        let range_valid = reader.read_i32()? > 0;
+        let first = reader.read_f64()?;
+        let last = reader.read_f64()?;
+        (range_valid, first, last)
+    } else {
+        (false, 0.0, 0.0)
+    };
+
+    // IsolationWidthOffset (v66+)
+    let isolation_width_offset = if ver >= 66 {
+        reader.read_f64()?
+    } else {
+        0.0
+    };
+
+    // Ensure we advanced exactly rxn_size bytes (handles struct padding)
+    let expected_end = start + rxn_size as u64;
+    if reader.position() != expected_end {
+        reader.set_position(expected_end);
+    }
+
+    Ok(Reaction {
+        precursor_mz,
+        isolation_width,
+        collision_energy,
+        collision_energy_valid,
+        precursor_range_valid,
+        first_precursor_mass,
+        last_precursor_mass,
+        isolation_width_offset,
+    })
+}
+
 /// Parse a single ScanEvent from the data stream.
 ///
-/// Reads: preamble (version-dependent size) + reactions + conversion params.
+/// Reads the full ScanEvent structure following the decompiled ScanEvent.Load:
+///   preamble → reactions → mass_ranges → mass_calibrators →
+///   source_fragmentations → source_fragmentation_mass_ranges → name (v65+)
+///
+/// Returns the parsed ScanEvent and the final reader position.
 pub fn parse_scan_event(
     data: &[u8],
     offset: u64,
     ver: u32,
-) -> Result<ScanEvent, RawError> {
+) -> Result<(ScanEvent, u64), RawError> {
     let preamble_size = version::scan_event_preamble_size(ver);
     let mut reader = BinaryReader::at_offset(data, offset);
 
-    // Read preamble bytes
+    // 1. Read preamble bytes (ScanEventInfoStruct)
     let preamble_bytes = reader.read_bytes(preamble_size)?;
-    let preamble = parse_preamble(&preamble_bytes);
+    let mut preamble = parse_preamble(&preamble_bytes);
 
-    // Read reactions
+    // 2. Read reactions array
     let n_precursors = reader.read_u32()?;
     if n_precursors > 100 {
         return Err(RawError::CorruptedData(format!(
@@ -242,40 +391,41 @@ pub fn parse_scan_event(
 
     let mut reactions = Vec::with_capacity(n_precursors as usize);
     for _ in 0..n_precursors {
-        let precursor_mz = reader.read_f64()?;
-        let isolation_width = reader.read_f64()?;
-        let collision_energy = reader.read_f64()?;
-        let _unknown1 = reader.read_u32()?;
-        let _unknown2 = reader.read_u32()?;
-        reactions.push(Reaction {
-            precursor_mz,
-            isolation_width,
-            collision_energy,
-        });
+        reactions.push(parse_reaction(&mut reader, ver)?);
     }
 
-    // Skip unknown u32
-    let _unknown1 = reader.read_u32()?;
-    // Fraction collector (low_mz, high_mz)
-    let _frac_low = reader.read_f64()?;
-    let _frac_high = reader.read_f64()?;
-
-    // Conversion parameters
-    let n_conversion_params = reader.read_u32()?;
-    if n_conversion_params > 20 {
-        return Err(RawError::CorruptedData(format!(
-            "ScanEvent has unreasonable n_conversion_params: {}",
-            n_conversion_params
-        )));
+    // Derive activation type from the last reaction's CollisionEnergyValid
+    if let Some(last_rxn) = reactions.last() {
+        preamble.activation = last_rxn.activation_type();
     }
 
-    let conversion_params = reader.read_f64_array(n_conversion_params as usize)?;
+    // 3. Read mass ranges: u32 count + count * (f64 low, f64 high)
+    let _mass_ranges = read_mass_range_array(&mut reader)?;
 
-    Ok(ScanEvent {
-        preamble,
-        reactions,
-        conversion_params,
-    })
+    // 4. Read mass calibrators (conversion params): u32 count + count * f64
+    let conversion_params = read_doubles_array(&mut reader)?;
+
+    // 5. Read source fragmentations: u32 count + count * f64
+    let _source_fragmentations = read_doubles_array(&mut reader)?;
+
+    // 6. Read source fragmentation mass ranges: u32 count + count * (f64, f64)
+    let _source_frag_mass_ranges = read_mass_range_array(&mut reader)?;
+
+    // 7. Name string (v65+ only)
+    if ver >= 65 {
+        let _name = reader.read_pascal_string()?;
+    }
+
+    let end_pos = reader.position();
+
+    Ok((
+        ScanEvent {
+            preamble,
+            reactions,
+            conversion_params,
+        },
+        end_pos,
+    ))
 }
 
 /// Parse all unique scan events from the scan params stream.
@@ -302,14 +452,11 @@ pub fn parse_scan_events(
     }
 
     let mut events = Vec::with_capacity(n_events as usize);
+    let mut next_offset = reader.position();
+
     for _ in 0..n_events {
-        let event_offset = reader.position();
-        let event = parse_scan_event(data, event_offset, ver)?;
-        // Advance reader past this event (parse_scan_event uses its own reader)
-        let preamble_size = version::scan_event_preamble_size(ver) as u64;
-        let reactions_size = 4 + (event.reactions.len() as u64 * 32);
-        let conv_size = 4 + 8 + 8 + 4 + (event.conversion_params.len() as u64 * 8);
-        reader.set_position(event_offset + preamble_size + reactions_size + conv_size);
+        let (event, end_pos) = parse_scan_event(data, next_offset, ver)?;
+        next_offset = end_pos;
         events.push(event);
     }
 
@@ -398,7 +545,6 @@ mod tests {
         data[7] = 0; // Full
         data[10] = 0; // not dependent
         data[11] = 5; // NSI
-        data[24] = 1; // HCD
         data[40] = 4; // FTMS
 
         let preamble = parse_preamble(&data);
@@ -408,7 +554,6 @@ mod tests {
         assert_eq!(preamble.scan_type, ScanType::Full);
         assert!(!preamble.dependent);
         assert_eq!(preamble.ionization, IonizationType::Nsi);
-        assert_eq!(preamble.activation, ActivationType::Hcd);
         assert_eq!(preamble.analyzer, AnalyzerType::Ftms);
     }
 
@@ -420,7 +565,6 @@ mod tests {
         data[6] = 2; // MS2
         data[7] = 0; // Full
         data[10] = 1; // dependent (DDA)
-        data[24] = 0; // CID
         data[40] = 0; // ITMS
 
         let preamble = parse_preamble(&data);
@@ -428,7 +572,6 @@ mod tests {
         assert_eq!(preamble.scan_mode, ScanMode::Centroid);
         assert!(matches!(preamble.ms_level, MsLevel::Ms2));
         assert!(preamble.dependent);
-        assert_eq!(preamble.activation, ActivationType::Cid);
         assert_eq!(preamble.analyzer, AnalyzerType::Itms);
     }
 

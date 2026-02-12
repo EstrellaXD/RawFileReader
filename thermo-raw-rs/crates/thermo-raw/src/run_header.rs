@@ -3,6 +3,16 @@
 //! The RunHeader is the primary index structure for each instrument.
 //! It contains SampleInfo (scan range, time/mass range) and addresses
 //! to ScanIndex, DataStream, TrailerExtra, etc.
+//!
+//! From decompiled RunHeader.Load version dispatch:
+//! - v66+: RunHeaderStruct  (current, has InstrumentType at end)
+//! - v64-65: RunHeaderStruct5 (64-bit offsets, Extra0-5, no InstrumentType)
+//! - v49-63: RunHeaderStruct4 (ends at FilterMassPrecision, 32-bit offsets only)
+//! - v40-48: RunHeaderStruct3
+//! - v25-39: RunHeaderStruct2
+//! - v<25: RunHeaderStruct1
+//!
+//! For v<=63, 32-bit offsets are promoted to 64-bit via ConvertFrom32Bit.
 
 use crate::io_utils::BinaryReader;
 use crate::RawError;
@@ -36,6 +46,9 @@ pub struct RunHeader {
     pub sample_tag1: String,
     pub sample_tag2: String,
     pub sample_tag3: String,
+    /// Instrument type identifier (v66+ only, 0 for older versions).
+    /// Avoids hardcoded instrument name checks in code.
+    pub instrument_type: i32,
     /// Byte offset after parsing.
     pub end_offset: u64,
 }
@@ -90,23 +103,36 @@ impl RunHeader {
         reader.skip(16)?; // unknown4..7
         let _own_addr_32 = reader.read_u32()?;
 
-        // === Version 64-66 extra fields ===
+        // === Version 64+ extra fields (64-bit addresses) ===
+        // From decompiled RunHeaderStruct5/RunHeaderStruct (v64+):
+        //   SpectPos (i64), PacketPos (i64), StatusLogPos (i64),
+        //   ErrorLogPos (i64), RunHeaderPos (i64),
+        //   TrailerScanEventsPos (i64), TrailerExtraPos (i64),
+        //   VirtualControllerInfoStruct (16 bytes),
+        //   Extra0..5 Pos/Count pairs (12 bytes each = 72 bytes)
         let mut scan_index_addr_64 = None;
         let mut data_addr_64 = None;
         let mut scan_trailer_addr_64 = None;
         let mut scan_params_addr_64 = None;
+        let mut instrument_type = 0i32;
 
         if version >= 64 {
-            scan_index_addr_64 = Some(reader.read_u64()?);
-            data_addr_64 = Some(reader.read_u64()?);
-            let _inst_log_addr_64 = reader.read_u64()?;
-            let _error_log_addr_64 = reader.read_u64()?;
-            let _unknown_addr1_64 = reader.read_u64()?;
-            scan_trailer_addr_64 = Some(reader.read_u64()?);
-            scan_params_addr_64 = Some(reader.read_u64()?);
-            reader.skip(8)?; // unknown5..6
-            let _own_addr_64 = reader.read_u64()?;
-            reader.skip(96)?; // unknown7..30 (24 u32s)
+            scan_index_addr_64 = Some(reader.read_u64()?);   // SpectPos
+            data_addr_64 = Some(reader.read_u64()?);          // PacketPos
+            let _inst_log_addr_64 = reader.read_u64()?;       // StatusLogPos
+            let _error_log_addr_64 = reader.read_u64()?;      // ErrorLogPos
+            let _run_header_addr_64 = reader.read_u64()?;     // RunHeaderPos
+            scan_trailer_addr_64 = Some(reader.read_u64()?);  // TrailerScanEventsPos
+            scan_params_addr_64 = Some(reader.read_u64()?);   // TrailerExtraPos
+            // VirtualControllerInfoStruct: VirtualDeviceType(4) + VirtualDeviceIndex(4) + Offset(8) = 16
+            reader.skip(16)?;
+            // Extra0..5: each is Pos(i64) + Count(i32) = 12 bytes, 6 pairs = 72 bytes
+            reader.skip(72)?;
+
+            // v66+: InstrumentType field (i32)
+            if version >= 66 {
+                instrument_type = reader.read_i32()?;
+            }
         }
 
         // PascalStringWin32 strings: device name, model, serial, software, tags
@@ -142,6 +168,7 @@ impl RunHeader {
             sample_tag1,
             sample_tag2,
             sample_tag3,
+            instrument_type,
             end_offset: reader.position(),
         })
     }

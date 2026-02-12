@@ -377,7 +377,8 @@ impl RawFile {
         // Build precursor info from scan event reactions for MS2+ scans
         if !matches!(scan.ms_level, MsLevel::Ms1) {
             if let Some(reaction) = event.reactions.last() {
-                let activation_str = format!("{}", preamble.activation);
+                // Derive activation type from the Reaction's CollisionEnergyValid field
+                let activation_str = format!("{}", reaction.activation_type());
                 scan.precursor = Some(PrecursorInfo {
                     mz: reaction.precursor_mz,
                     charge: None, // Not available from scan event

@@ -62,21 +62,34 @@ pub fn decode_scan(
     scan_number: u32,
 ) -> Result<Scan, RawError> {
     let abs_offset = data_addr as u64 + entry.offset;
-    if abs_offset as usize + entry.data_size as usize > data.len() {
+    // Bounds check: for v65+ we have DataSize; for v<65 just verify offset is valid
+    if entry.data_size > 0 {
+        if abs_offset as usize + entry.data_size as usize > data.len() {
+            return Err(RawError::ScanDecodeError {
+                offset: abs_offset as usize,
+                reason: format!(
+                    "scan {} data extends beyond file (offset={}, size={}, file_len={})",
+                    scan_number,
+                    abs_offset,
+                    entry.data_size,
+                    data.len()
+                ),
+            });
+        }
+    } else if abs_offset as usize >= data.len() {
         return Err(RawError::ScanDecodeError {
             offset: abs_offset as usize,
             reason: format!(
-                "scan {} data extends beyond file (offset={}, size={}, file_len={})",
+                "scan {} data offset beyond file (offset={}, file_len={})",
                 scan_number,
                 abs_offset,
-                entry.data_size,
                 data.len()
             ),
         });
     }
 
-    // If data_size is 0, return an empty scan
-    if entry.data_size == 0 {
+    // Empty scan: no packets and no data size means nothing to decode
+    if entry.number_packets == 0 && entry.data_size == 0 {
         return Ok(Scan {
             scan_number,
             rt: entry.rt,

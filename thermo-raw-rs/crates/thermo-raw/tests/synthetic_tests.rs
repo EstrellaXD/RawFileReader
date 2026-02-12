@@ -170,25 +170,33 @@ fn test_scan_event_preamble_all_fields() {
     preamble_data[24] = 1; // HCD
     preamble_data[40] = 4; // FTMS
 
-    // Build a full scan event buffer: preamble + n_precursors=1 + reaction + unknown + frac + n_conv=0
+    // Build a full scan event buffer matching decompiled ScanEvent.Load layout:
+    //   preamble + reactions + mass_ranges + calibrators + source_frags + source_frag_ranges
     let mut data = preamble_data;
     // n_precursors = 1
     data.extend_from_slice(&1u32.to_le_bytes());
-    // Reaction: precursor_mz, isolation_width, collision_energy, unknown1, unknown2
+    // Reaction (32 bytes for v57: MsReactionStruct2):
+    //   PrecursorMass, IsolationWidth, CollisionEnergy, CollisionEnergyValid, (padding)
     data.extend_from_slice(&524.2648f64.to_le_bytes());
     data.extend_from_slice(&1.5f64.to_le_bytes());
     data.extend_from_slice(&28.0f64.to_le_bytes());
+    // CollisionEnergyValid: bit 0 = valid (1), bits 1-8 = HCD (1) → value = 1 | (1 << 1) = 3
+    data.extend_from_slice(&3u32.to_le_bytes());
+    // struct padding (4 bytes to reach 32-byte reaction size)
     data.extend_from_slice(&0u32.to_le_bytes());
-    data.extend_from_slice(&0u32.to_le_bytes());
-    // unknown u32
-    data.extend_from_slice(&0u32.to_le_bytes());
-    // frac_low, frac_high
+    // n_mass_ranges = 1
+    data.extend_from_slice(&1u32.to_le_bytes());
+    // mass range: (100.0, 1060.0)
     data.extend_from_slice(&100.0f64.to_le_bytes());
     data.extend_from_slice(&1060.0f64.to_le_bytes());
-    // n_conversion_params = 0
+    // n_conversion_params (mass calibrators) = 0
+    data.extend_from_slice(&0u32.to_le_bytes());
+    // n_source_fragmentations = 0
+    data.extend_from_slice(&0u32.to_le_bytes());
+    // n_source_frag_mass_ranges = 0
     data.extend_from_slice(&0u32.to_le_bytes());
 
-    let event =
+    let (event, _end_pos) =
         thermo_raw::scan_event::parse_scan_event(&data, 0, 57).unwrap();
 
     assert_eq!(event.preamble.polarity, thermo_raw::Polarity::Positive);
@@ -197,12 +205,14 @@ fn test_scan_event_preamble_all_fields() {
     assert_eq!(event.preamble.scan_type, ScanType::Sim);
     assert!(event.preamble.dependent);
     assert_eq!(event.preamble.ionization, IonizationType::Esi);
+    // Activation derived from Reaction's CollisionEnergyValid field (bits 1-8 = 1 = HCD)
     assert_eq!(event.preamble.activation, ActivationType::Hcd);
     assert_eq!(event.preamble.analyzer, AnalyzerType::Ftms);
     assert_eq!(event.reactions.len(), 1);
     assert!((event.reactions[0].precursor_mz - 524.2648).abs() < 1e-4);
     assert!((event.reactions[0].isolation_width - 1.5).abs() < 1e-6);
     assert!((event.reactions[0].collision_energy - 28.0).abs() < 1e-6);
+    assert_eq!(event.reactions[0].collision_energy_valid, 3); // valid + HCD
     assert!(event.conversion_params.is_empty());
 }
 
