@@ -37,7 +37,6 @@ pub mod trailer;
 pub mod types;
 pub mod version;
 
-#[cfg(test)]
 pub mod validation;
 
 pub use error::RawError;

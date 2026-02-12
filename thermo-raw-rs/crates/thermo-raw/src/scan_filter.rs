@@ -5,6 +5,14 @@
 
 use crate::types::{MsLevel, Polarity};
 
+/// Precursor info extracted from a filter string.
+#[derive(Debug, Clone)]
+pub struct FilterPrecursor {
+    pub mz: f64,
+    pub activation: String,
+    pub collision_energy: f64,
+}
+
 /// Parsed scan filter.
 #[derive(Debug, Clone)]
 pub struct ScanFilter {
@@ -13,6 +21,7 @@ pub struct ScanFilter {
     pub analyzer: String,
     pub scan_mode: String,
     pub mass_range: Option<(f64, f64)>,
+    pub precursor: Option<FilterPrecursor>,
     pub raw_string: String,
 }
 
@@ -26,10 +35,11 @@ pub fn parse_filter(filter: &str) -> ScanFilter {
         Polarity::Unknown
     };
 
-    let ms_level = if filter.contains("ms2") || filter.contains("ms 2") {
-        MsLevel::Ms2
-    } else if filter.contains("ms3") || filter.contains("ms 3") {
+    let lower = filter.to_lowercase();
+    let ms_level = if lower.contains("ms3") || lower.contains("ms 3") {
         MsLevel::Ms3
+    } else if lower.contains("ms2") || lower.contains("ms 2") {
+        MsLevel::Ms2
     } else {
         MsLevel::Ms1
     };
@@ -52,8 +62,13 @@ pub fn parse_filter(filter: &str) -> ScanFilter {
         "Unknown".to_string()
     };
 
-    // Parse mass range [low-high]
     let mass_range = parse_mass_range(filter);
+
+    let precursor = if matches!(ms_level, MsLevel::Ms2 | MsLevel::Ms3) {
+        parse_precursor_from_filter(filter)
+    } else {
+        None
+    };
 
     ScanFilter {
         ms_level,
@@ -61,12 +76,56 @@ pub fn parse_filter(filter: &str) -> ScanFilter {
         analyzer,
         scan_mode,
         mass_range,
+        precursor,
         raw_string: filter.to_string(),
     }
 }
 
+/// Extract precursor m/z, activation type, and collision energy from a filter string.
+///
+/// Parses patterns like "524.2648@hcd28.00" from filter strings such as:
+/// "FTMS + c NSI d Full ms2 524.2648@hcd28.00 [100.0000-1060.0000]"
+fn parse_precursor_from_filter(filter: &str) -> Option<FilterPrecursor> {
+    let at_pos = filter.rfind('@')?;
+
+    // Extract precursor m/z: scan backwards from '@' for the number
+    let before_at = &filter[..at_pos];
+    let mz_start = before_at
+        .rfind(|c: char| !c.is_ascii_digit() && c != '.')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let mz_str = before_at[mz_start..].trim();
+    if mz_str.is_empty() {
+        return None;
+    }
+    let precursor_mz: f64 = mz_str.parse().ok()?;
+
+    // Extract activation type (alphabetic chars after '@')
+    let after_at = &filter[at_pos + 1..];
+    let type_end = after_at
+        .find(|c: char| c.is_ascii_digit() || c == '.')
+        .unwrap_or(after_at.len());
+    let activation = after_at[..type_end].to_lowercase();
+
+    // Collision energy follows the activation type
+    let ce_str = &after_at[type_end..];
+    let ce_end = ce_str
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(ce_str.len());
+    let collision_energy: f64 = if ce_end > 0 {
+        ce_str[..ce_end].parse().unwrap_or(0.0)
+    } else {
+        0.0
+    };
+
+    Some(FilterPrecursor {
+        mz: precursor_mz,
+        activation,
+        collision_energy,
+    })
+}
+
 fn parse_mass_range(filter: &str) -> Option<(f64, f64)> {
-    // Look for pattern [low-high] or [low.xx-high.xx]
     let start = filter.find('[')?;
     let end = filter.find(']')?;
     let range_str = &filter[start + 1..end];
@@ -92,6 +151,7 @@ mod tests {
         assert_eq!(filter.analyzer, "FTMS");
         assert_eq!(filter.scan_mode, "Full");
         assert_eq!(filter.mass_range, Some((200.0, 2000.0)));
+        assert!(filter.precursor.is_none());
     }
 
     #[test]
@@ -102,8 +162,36 @@ mod tests {
 
     #[test]
     fn test_parse_ms2() {
-        let filter = parse_filter("FTMS + c NSI d Full ms2 524.2648@hcd28.00 [100.0000-1060.0000]");
+        let filter =
+            parse_filter("FTMS + c NSI d Full ms2 524.2648@hcd28.00 [100.0000-1060.0000]");
         assert!(matches!(filter.ms_level, MsLevel::Ms2));
         assert_eq!(filter.mass_range, Some((100.0, 1060.0)));
+        let precursor = filter.precursor.as_ref().unwrap();
+        assert!((precursor.mz - 524.2648).abs() < 1e-4);
+        assert_eq!(precursor.activation, "hcd");
+        assert!((precursor.collision_energy - 28.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_ms2_cid() {
+        let filter = parse_filter("ITMS + c NSI d Full ms2 445.120@cid35.00 [120.00-900.00]");
+        assert!(matches!(filter.ms_level, MsLevel::Ms2));
+        let precursor = filter.precursor.as_ref().unwrap();
+        assert!((precursor.mz - 445.12).abs() < 1e-4);
+        assert_eq!(precursor.activation, "cid");
+        assert!((precursor.collision_energy - 35.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_ms3() {
+        let filter = parse_filter(
+            "ITMS + c NSI d Full ms3 524.26@hcd28.00 300.15@hcd35.00 [100.00-600.00]",
+        );
+        assert!(matches!(filter.ms_level, MsLevel::Ms3));
+        // rfind('@') gets the last precursor (300.15), which is the direct MS3 precursor
+        let precursor = filter.precursor.as_ref().unwrap();
+        assert!((precursor.mz - 300.15).abs() < 0.01);
+        assert_eq!(precursor.activation, "hcd");
+        assert!((precursor.collision_energy - 35.0).abs() < 0.01);
     }
 }

@@ -61,13 +61,144 @@ fn field_byte_size(desc: &GenericDataDescriptor) -> usize {
     }
 }
 
-/// Calculate the total byte size of one GenericRecord.
-fn record_byte_size(header: &GenericDataHeader) -> usize {
-    header
-        .descriptors
-        .iter()
-        .map(|d| field_byte_size(d))
-        .sum()
+/// Pre-computed layout for fast trailer field access.
+///
+/// Caches field byte offsets and indices of commonly-used fields for O(1) lookup
+/// instead of re-computing on every scan.
+#[derive(Debug, Clone)]
+pub struct TrailerLayout {
+    pub header: GenericDataHeader,
+    pub record_size: usize,
+    /// Byte offset of each field within a record.
+    pub field_offsets: Vec<usize>,
+    /// Index of "Filter Text" field (if present).
+    pub filter_text_idx: Option<usize>,
+    /// Index of "Charge State" field.
+    pub charge_state_idx: Option<usize>,
+    /// Index of "Monoisotopic M/Z" field.
+    pub mono_mz_idx: Option<usize>,
+    /// Index of "Ion Injection Time (ms)" field.
+    pub injection_time_idx: Option<usize>,
+    /// Index of "Master Scan Number" field.
+    pub master_scan_idx: Option<usize>,
+    /// Index of "MS2 Isolation Width" field.
+    pub isolation_width_idx: Option<usize>,
+}
+
+impl TrailerLayout {
+    /// Build a TrailerLayout from a parsed GenericDataHeader.
+    pub fn from_header(header: GenericDataHeader) -> Self {
+        let mut field_offsets = Vec::with_capacity(header.descriptors.len());
+        let mut offset = 0usize;
+        for desc in &header.descriptors {
+            field_offsets.push(offset);
+            offset += field_byte_size(desc);
+        }
+        let record_size = offset;
+
+        let find_field = |name: &str| -> Option<usize> {
+            header.descriptors.iter().position(|d| {
+                d.label
+                    .trim_end_matches(':')
+                    .trim()
+                    .eq_ignore_ascii_case(name)
+            })
+        };
+
+        let filter_text_idx = find_field("Filter Text");
+        let charge_state_idx = find_field("Charge State");
+        let mono_mz_idx = find_field("Monoisotopic M/Z");
+        let injection_time_idx = find_field("Ion Injection Time (ms)");
+        let master_scan_idx =
+            find_field("Master Scan Number").or_else(|| find_field("Master Index"));
+        let isolation_width_idx = find_field("MS2 Isolation Width");
+
+        Self {
+            header,
+            record_size,
+            field_offsets,
+            filter_text_idx,
+            charge_state_idx,
+            mono_mz_idx,
+            injection_time_idx,
+            master_scan_idx,
+            isolation_width_idx,
+        }
+    }
+
+    /// Get the absolute byte offset of a field for a given scan.
+    fn field_offset(&self, scan_index: u32, field_idx: usize) -> u64 {
+        self.header.records_offset
+            + (scan_index as u64) * (self.record_size as u64)
+            + self.field_offsets[field_idx] as u64
+    }
+
+    /// Read a specific field as f64.
+    pub fn read_f64(
+        &self,
+        data: &[u8],
+        scan_index: u32,
+        field_idx: usize,
+    ) -> Result<f64, RawError> {
+        let offset = self.field_offset(scan_index, field_idx);
+        let mut reader = BinaryReader::at_offset(data, offset);
+        let desc = &self.header.descriptors[field_idx];
+        match desc.type_code {
+            type_codes::F64 | type_codes::F64_ALT => reader.read_f64(),
+            type_codes::F32 | type_codes::F32_ALT => Ok(reader.read_f32()? as f64),
+            type_codes::I32 => Ok(reader.read_i32()? as f64),
+            type_codes::I16 => Ok(reader.read_u16()? as i16 as f64),
+            type_codes::U32 => Ok(reader.read_u32()? as f64),
+            _ => Err(RawError::CorruptedData(format!(
+                "Cannot read field '{}' as f64 (type_code=0x{:X})",
+                desc.label, desc.type_code
+            ))),
+        }
+    }
+
+    /// Read a specific field as i32.
+    pub fn read_i32(
+        &self,
+        data: &[u8],
+        scan_index: u32,
+        field_idx: usize,
+    ) -> Result<i32, RawError> {
+        let offset = self.field_offset(scan_index, field_idx);
+        let mut reader = BinaryReader::at_offset(data, offset);
+        let desc = &self.header.descriptors[field_idx];
+        match desc.type_code {
+            type_codes::I32 => reader.read_i32(),
+            type_codes::I16 => Ok(reader.read_u16()? as i16 as i32),
+            type_codes::I8 => Ok(reader.read_u8()? as i8 as i32),
+            type_codes::U32 => Ok(reader.read_u32()? as i32),
+            type_codes::U16 => Ok(reader.read_u16()? as i32),
+            _ => Err(RawError::CorruptedData(format!(
+                "Cannot read field '{}' as i32 (type_code=0x{:X})",
+                desc.label, desc.type_code
+            ))),
+        }
+    }
+
+    /// Read a specific field as string.
+    pub fn read_string(
+        &self,
+        data: &[u8],
+        scan_index: u32,
+        field_idx: usize,
+    ) -> Result<String, RawError> {
+        let offset = self.field_offset(scan_index, field_idx);
+        let mut reader = BinaryReader::at_offset(data, offset);
+        read_field_as_string(&mut reader, &self.header.descriptors[field_idx])
+    }
+
+    /// Get field labels.
+    pub fn field_labels(&self) -> Vec<String> {
+        self.header
+            .descriptors
+            .iter()
+            .map(|d| d.label.trim_end_matches(':').trim().to_string())
+            .collect()
+    }
 }
 
 /// Parse the GenericDataHeader at the given offset.
@@ -102,14 +233,13 @@ pub fn parse_generic_data_header(data: &[u8], offset: u64) -> Result<GenericData
 
 /// Parse trailer extra data for a specific scan.
 ///
-/// `trailer_addr` is the absolute offset of the GenericDataHeader.
 /// `scan_index` is 0-based (scan_number - first_scan).
 pub fn parse_trailer_extra(
     data: &[u8],
     header: &GenericDataHeader,
     scan_index: u32,
 ) -> Result<TrailerExtra, RawError> {
-    let rec_size = record_byte_size(header);
+    let rec_size: usize = header.descriptors.iter().map(|d| field_byte_size(d)).sum();
     let rec_offset = header.records_offset + (scan_index as u64) * (rec_size as u64);
 
     let mut reader = BinaryReader::at_offset(data, rec_offset);
@@ -193,4 +323,87 @@ pub fn parse_trailer_fields(data: &[u8], trailer_addr: u64) -> Result<Vec<String
         .iter()
         .map(|d| d.label.trim_end_matches(':').trim().to_string())
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal GenericDataHeader + record data for testing TrailerLayout.
+    fn build_test_data() -> (Vec<u8>, GenericDataHeader) {
+        // Build header with 3 fields: i32 "Charge State", f64 "Monoisotopic M/Z", i16 "Access Id"
+        let descriptors = vec![
+            GenericDataDescriptor {
+                type_code: type_codes::I32,
+                length: 4,
+                label: "Charge State:".to_string(),
+            },
+            GenericDataDescriptor {
+                type_code: type_codes::F64,
+                length: 8,
+                label: "Monoisotopic M/Z:".to_string(),
+            },
+            GenericDataDescriptor {
+                type_code: type_codes::I16,
+                length: 2,
+                label: "Access Id:".to_string(),
+            },
+        ];
+        // record_size = 4 + 8 + 2 = 14 bytes
+        let records_offset = 0u64;
+
+        // Build 2 records:
+        // Record 0: charge=2, mz=524.2648, access_id=1
+        // Record 1: charge=3, mz=445.120, access_id=2
+        let mut data = Vec::new();
+        // Record 0
+        data.extend_from_slice(&2i32.to_le_bytes());
+        data.extend_from_slice(&524.2648f64.to_le_bytes());
+        data.extend_from_slice(&1i16.to_le_bytes());
+        // Record 1
+        data.extend_from_slice(&3i32.to_le_bytes());
+        data.extend_from_slice(&445.120f64.to_le_bytes());
+        data.extend_from_slice(&2i16.to_le_bytes());
+
+        let header = GenericDataHeader {
+            descriptors,
+            records_offset,
+        };
+
+        (data, header)
+    }
+
+    #[test]
+    fn test_trailer_layout_field_indices() {
+        let (_, header) = build_test_data();
+        let layout = TrailerLayout::from_header(header);
+
+        assert_eq!(layout.record_size, 14);
+        assert_eq!(layout.field_offsets, vec![0, 4, 12]);
+        assert_eq!(layout.charge_state_idx, Some(0));
+        assert_eq!(layout.mono_mz_idx, Some(1));
+        assert!(layout.filter_text_idx.is_none());
+    }
+
+    #[test]
+    fn test_trailer_layout_read_typed() {
+        let (data, header) = build_test_data();
+        let layout = TrailerLayout::from_header(header);
+
+        // Record 0
+        assert_eq!(layout.read_i32(&data, 0, 0).unwrap(), 2);
+        assert!((layout.read_f64(&data, 0, 1).unwrap() - 524.2648).abs() < 1e-4);
+
+        // Record 1
+        assert_eq!(layout.read_i32(&data, 1, 0).unwrap(), 3);
+        assert!((layout.read_f64(&data, 1, 1).unwrap() - 445.120).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_trailer_layout_field_labels() {
+        let (_, header) = build_test_data();
+        let layout = TrailerLayout::from_header(header);
+        let labels = layout.field_labels();
+        assert_eq!(labels, vec!["Charge State", "Monoisotopic M/Z", "Access Id"]);
+    }
 }

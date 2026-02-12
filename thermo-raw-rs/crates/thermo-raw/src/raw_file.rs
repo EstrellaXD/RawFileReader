@@ -6,18 +6,36 @@ use crate::metadata;
 use crate::raw_file_info::RawFileInfo;
 use crate::run_header::RunHeader;
 use crate::scan_data;
+use crate::scan_filter;
 use crate::scan_index::{self, ScanIndexEntry};
-use crate::trailer;
-use crate::types::{Chromatogram, FileMetadata, MsLevel, Polarity, Scan};
+use crate::trailer::{self, TrailerLayout};
+use crate::types::{Chromatogram, FileMetadata, MsLevel, Polarity, PrecursorInfo, Scan};
 use crate::version;
 use crate::RawError;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::path::Path;
+
+/// Abstraction over file data sources (owned bytes or memory-mapped).
+enum FileData {
+    Owned(Vec<u8>),
+    Mapped(memmap2::Mmap),
+}
+
+impl Deref for FileData {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            FileData::Owned(v) => v,
+            FileData::Mapped(m) => m,
+        }
+    }
+}
 
 /// A Thermo RAW file opened for reading.
 pub struct RawFile {
-    /// Raw file bytes (memory-mapped or read into memory).
-    data: Vec<u8>,
+    /// Raw file bytes (owned or memory-mapped).
+    data: FileData,
     /// RAW file format version.
     version: u32,
     /// File-level metadata.
@@ -28,26 +46,34 @@ pub struct RawFile {
     scan_index: Vec<ScanIndexEntry>,
     /// Base address of the data stream.
     data_addr: u64,
-    /// Trailer extra header (lazy-parsed on first use).
-    trailer_header: Option<trailer::GenericDataHeader>,
-    /// Trailer extra address.
-    trailer_addr: u64,
+    /// Pre-computed trailer layout (eagerly parsed on open).
+    trailer_layout: Option<TrailerLayout>,
 }
 
 impl RawFile {
-    /// Open a Thermo RAW file.
+    /// Open a Thermo RAW file, reading it entirely into memory.
     ///
-    /// Parses the Finnigan file header, RawFileInfo, RunHeader, and ScanIndex.
-    /// Scan data is decoded lazily on demand.
+    /// Parses the Finnigan file header, RawFileInfo, RunHeader, ScanIndex,
+    /// and trailer layout. Scan data is decoded lazily on demand.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RawError> {
         let data = std::fs::read(path.as_ref())?;
+        Self::from_data(FileData::Owned(data))
+    }
 
-        // Thermo RAW files are OLE2 containers. The Finnigan data starts
-        // within the main data stream. For now we parse the raw bytes directly,
-        // treating the entire file content as the data stream.
-        // The Finnigan magic (0xA101) should be found at or near the beginning
-        // of the file data.
+    /// Open a Thermo RAW file using memory-mapping.
+    ///
+    /// More memory-efficient for large files — the OS pages data on demand.
+    ///
+    /// # Safety
+    /// The file must not be modified while the RawFile is open.
+    pub fn open_mmap(path: impl AsRef<Path>) -> Result<Self, RawError> {
+        let file = std::fs::File::open(path.as_ref())?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        Self::from_data(FileData::Mapped(mmap))
+    }
 
+    /// Parse RAW file structures from raw data.
+    fn from_data(data: FileData) -> Result<Self, RawError> {
         // Find the Finnigan magic in the first 64KB of the file
         let finnigan_offset = find_finnigan_magic(&data).ok_or(RawError::NotRawFile)?;
 
@@ -78,6 +104,17 @@ impl RawFile {
         // Build metadata
         let file_metadata = metadata::build_metadata(&file_header, &raw_file_info, &run_header);
 
+        // Eagerly parse trailer layout (header only, not all records).
+        // This enables efficient per-scan trailer field access via precomputed offsets.
+        let trailer_layout = if trailer_addr > 0 {
+            match trailer::parse_generic_data_header(&data, trailer_addr) {
+                Ok(header) => Some(TrailerLayout::from_header(header)),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             data,
             version: ver,
@@ -85,8 +122,7 @@ impl RawFile {
             run_header,
             scan_index: scan_index_entries,
             data_addr,
-            trailer_header: None,
-            trailer_addr,
+            trailer_layout,
         })
     }
 
@@ -136,6 +172,9 @@ impl RawFile {
     }
 
     /// Read a single scan by scan number.
+    ///
+    /// Decodes the scan data packet and enriches with trailer-derived metadata
+    /// (filter string, MS level, polarity, precursor info).
     pub fn scan(&self, scan_number: u32) -> Result<Scan, RawError> {
         let idx = scan_number
             .checked_sub(self.run_header.first_scan)
@@ -144,22 +183,33 @@ impl RawFile {
             .scan_index
             .get(idx)
             .ok_or(RawError::ScanOutOfRange(scan_number))?;
-        scan_data::decode_scan(&self.data, self.data_addr as usize, entry, scan_number)
+        let mut scan =
+            scan_data::decode_scan(&self.data, self.data_addr as usize, entry, scan_number)?;
+
+        // Enrich with trailer-derived metadata
+        self.enrich_scan(&mut scan, idx as u32);
+
+        Ok(scan)
     }
 
     /// Read multiple scans in parallel using rayon.
+    ///
+    /// Each scan is enriched with trailer-derived metadata.
     pub fn scans_parallel(&self, range: std::ops::Range<u32>) -> Result<Vec<Scan>, RawError> {
         use rayon::prelude::*;
         let first = self.run_header.first_scan;
         let entries: Vec<_> = range
             .map(|n| ((n - first) as usize, n))
-            .filter_map(|(idx, n)| self.scan_index.get(idx).map(|e| (e, n)))
+            .filter_map(|(idx, n)| self.scan_index.get(idx).map(|e| (e, n, idx as u32)))
             .collect();
 
         entries
             .par_iter()
-            .map(|(entry, scan_num)| {
-                scan_data::decode_scan(&self.data, self.data_addr as usize, entry, *scan_num)
+            .map(|(entry, scan_num, scan_idx)| {
+                let mut scan =
+                    scan_data::decode_scan(&self.data, self.data_addr as usize, entry, *scan_num)?;
+                self.enrich_scan(&mut scan, *scan_idx);
+                Ok(scan)
             })
             .collect()
     }
@@ -219,19 +269,13 @@ impl RawFile {
         })
     }
 
-    /// Get trailer extra data for a specific scan.
+    /// Get trailer extra data for a specific scan as a HashMap.
     pub fn trailer_extra(
-        &mut self,
+        &self,
         scan_number: u32,
     ) -> Result<HashMap<String, String>, RawError> {
-        // Lazy-parse trailer header on first access
-        if self.trailer_header.is_none() && self.trailer_addr > 0 {
-            self.trailer_header =
-                Some(trailer::parse_generic_data_header(&self.data, self.trailer_addr)?);
-        }
-
-        let header = self
-            .trailer_header
+        let layout = self
+            .trailer_layout
             .as_ref()
             .ok_or_else(|| RawError::StreamNotFound("trailer extra".to_string()))?;
 
@@ -239,15 +283,15 @@ impl RawFile {
             .checked_sub(self.run_header.first_scan)
             .ok_or(RawError::ScanOutOfRange(scan_number))?;
 
-        trailer::parse_trailer_extra(&self.data, header, scan_idx)
+        trailer::parse_trailer_extra(&self.data, &layout.header, scan_idx)
     }
 
     /// Get the list of trailer extra field labels.
-    pub fn trailer_fields(&self) -> Result<Vec<String>, RawError> {
-        if self.trailer_addr == 0 {
-            return Ok(vec![]);
+    pub fn trailer_fields(&self) -> Vec<String> {
+        match &self.trailer_layout {
+            Some(layout) => layout.field_labels(),
+            None => vec![],
         }
-        trailer::parse_trailer_fields(&self.data, self.trailer_addr)
     }
 
     /// Get the raw scan index entries.
@@ -260,6 +304,77 @@ impl RawFile {
         let container = cfb_reader::Ole2Container::open(path)
             .map_err(|e| RawError::CfbError(e.to_string()))?;
         Ok(container.list_streams())
+    }
+
+    /// Enrich a scan with trailer-derived metadata.
+    ///
+    /// Extracts filter string from trailer extra, parses it for MS level and
+    /// polarity, and builds precursor info for MS2+ scans from both the filter
+    /// string and dedicated trailer fields (Monoisotopic M/Z, Charge State).
+    fn enrich_scan(&self, scan: &mut Scan, scan_idx: u32) {
+        let layout = match &self.trailer_layout {
+            Some(l) => l,
+            None => return,
+        };
+
+        // Extract filter string from trailer
+        if let Some(fi) = layout.filter_text_idx {
+            if let Ok(filter_str) = layout.read_string(&self.data, scan_idx, fi) {
+                if !filter_str.is_empty() {
+                    let filter = scan_filter::parse_filter(&filter_str);
+                    scan.ms_level = filter.ms_level;
+                    scan.polarity = filter.polarity;
+                    scan.filter_string = Some(filter_str);
+
+                    // Build precursor info for MS2+ scans
+                    if !matches!(scan.ms_level, MsLevel::Ms1) {
+                        scan.precursor =
+                            self.build_precursor_info(layout, scan_idx, &filter);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Build PrecursorInfo from trailer fields and filter string.
+    ///
+    /// Prefers trailer-derived monoisotopic m/z (more accurate) over filter m/z.
+    fn build_precursor_info(
+        &self,
+        layout: &TrailerLayout,
+        scan_idx: u32,
+        filter: &scan_filter::ScanFilter,
+    ) -> Option<PrecursorInfo> {
+        let filter_precursor = filter.precursor.as_ref();
+
+        // Get monoisotopic m/z from trailer (more accurate than filter string)
+        let mono_mz = layout
+            .mono_mz_idx
+            .and_then(|idx| layout.read_f64(&self.data, scan_idx, idx).ok())
+            .filter(|&mz| mz > 0.0);
+
+        // Get charge state from trailer
+        let charge = layout
+            .charge_state_idx
+            .and_then(|idx| layout.read_i32(&self.data, scan_idx, idx).ok())
+            .filter(|&c| c != 0);
+
+        // Get isolation width from trailer
+        let isolation_width = layout
+            .isolation_width_idx
+            .and_then(|idx| layout.read_f64(&self.data, scan_idx, idx).ok())
+            .filter(|&w| w > 0.0);
+
+        // Prefer monoisotopic m/z from trailer; fall back to filter string
+        let mz = mono_mz.or_else(|| filter_precursor.map(|p| p.mz))?;
+
+        Some(PrecursorInfo {
+            mz,
+            charge,
+            isolation_width,
+            activation_type: filter_precursor.map(|p| p.activation.clone()),
+            collision_energy: filter_precursor.map(|p| p.collision_energy),
+        })
     }
 }
 
