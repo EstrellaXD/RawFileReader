@@ -1,44 +1,93 @@
 //! Top-level entry point: open and read Thermo RAW files.
 
 use crate::chromatogram;
+use crate::file_header::FileHeader;
+use crate::metadata;
+use crate::raw_file_info::RawFileInfo;
 use crate::run_header::RunHeader;
 use crate::scan_data;
-use crate::scan_index::ScanIndexEntry;
+use crate::scan_index::{self, ScanIndexEntry};
+use crate::trailer;
 use crate::types::{Chromatogram, FileMetadata, MsLevel, Polarity, Scan};
+use crate::version;
 use crate::RawError;
+use std::collections::HashMap;
 use std::path::Path;
 
 /// A Thermo RAW file opened for reading.
 pub struct RawFile {
-    /// Memory-mapped file data.
-    _data: Vec<u8>,
+    /// Raw file bytes (memory-mapped or read into memory).
+    data: Vec<u8>,
     /// RAW file format version.
     version: u32,
     /// File-level metadata.
-    metadata: FileMetadata,
+    file_metadata: FileMetadata,
     /// Parsed run header.
     run_header: RunHeader,
     /// Scan index (one entry per scan).
     scan_index: Vec<ScanIndexEntry>,
-    /// Byte offset of the scan data stream within the file.
-    _scan_data_offset: usize,
-    /// Length of the scan data stream.
-    _scan_data_len: usize,
+    /// Base address of the data stream.
+    data_addr: u64,
+    /// Trailer extra header (lazy-parsed on first use).
+    trailer_header: Option<trailer::GenericDataHeader>,
+    /// Trailer extra address.
+    trailer_addr: u64,
 }
 
 impl RawFile {
     /// Open a Thermo RAW file.
     ///
-    /// This parses the OLE2 container, run header, scan index, and metadata.
+    /// Parses the Finnigan file header, RawFileInfo, RunHeader, and ScanIndex.
     /// Scan data is decoded lazily on demand.
-    pub fn open(_path: impl AsRef<Path>) -> Result<Self, RawError> {
-        // Implementation roadmap:
-        // 1. Memory-map the file
-        // 2. Parse OLE2 container, locate internal streams
-        // 3. Parse RunHeader stream
-        // 4. Parse ScanIndex stream
-        // 5. Cache metadata
-        todo!("Implement based on FORMAT_SPEC.md (Phase 2 output)")
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, RawError> {
+        let data = std::fs::read(path.as_ref())?;
+
+        // Thermo RAW files are OLE2 containers. The Finnigan data starts
+        // within the main data stream. For now we parse the raw bytes directly,
+        // treating the entire file content as the data stream.
+        // The Finnigan magic (0xA101) should be found at or near the beginning
+        // of the file data.
+
+        // Find the Finnigan magic in the first 64KB of the file
+        let finnigan_offset = find_finnigan_magic(&data).ok_or(RawError::NotRawFile)?;
+
+        // Parse FileHeader
+        let file_header = FileHeader::parse(&data[finnigan_offset..])?;
+        let ver = file_header.version;
+
+        if !version::is_supported(ver) {
+            return Err(RawError::UnsupportedVersion(ver));
+        }
+
+        // Parse RawFileInfo (immediately after FileHeader)
+        let info_offset = finnigan_offset as u64 + FileHeader::size() as u64;
+        let raw_file_info = RawFileInfo::parse(&data, info_offset, ver)?;
+
+        // Parse RunHeader at the address from RawFileInfo
+        let rh_addr = raw_file_info.run_header_addr();
+        let run_header = RunHeader::parse(&data, rh_addr, ver)?;
+
+        // Parse ScanIndex
+        let n_scans = run_header.n_scans();
+        let si_addr = run_header.scan_index_addr();
+        let scan_index_entries = scan_index::parse_scan_index(&data, si_addr, ver, n_scans)?;
+
+        let data_addr = run_header.data_addr();
+        let trailer_addr = run_header.scan_trailer_addr();
+
+        // Build metadata
+        let file_metadata = metadata::build_metadata(&file_header, &raw_file_info, &run_header);
+
+        Ok(Self {
+            data,
+            version: ver,
+            file_metadata,
+            run_header,
+            scan_index: scan_index_entries,
+            data_addr,
+            trailer_header: None,
+            trailer_addr,
+        })
     }
 
     /// RAW file format version.
@@ -48,7 +97,7 @@ impl RawFile {
 
     /// File-level metadata.
     pub fn metadata(&self) -> &FileMetadata {
-        &self.metadata
+        &self.file_metadata
     }
 
     /// Total number of scans.
@@ -76,14 +125,26 @@ impl RawFile {
         self.run_header.end_time
     }
 
+    /// Low mass range.
+    pub fn low_mass(&self) -> f64 {
+        self.run_header.low_mass
+    }
+
+    /// High mass range.
+    pub fn high_mass(&self) -> f64 {
+        self.run_header.high_mass
+    }
+
     /// Read a single scan by scan number.
     pub fn scan(&self, scan_number: u32) -> Result<Scan, RawError> {
-        let idx = (scan_number - self.run_header.first_scan) as usize;
+        let idx = scan_number
+            .checked_sub(self.run_header.first_scan)
+            .ok_or(RawError::ScanOutOfRange(scan_number))? as usize;
         let entry = self
             .scan_index
             .get(idx)
             .ok_or(RawError::ScanOutOfRange(scan_number))?;
-        scan_data::decode_scan(&self._data, self._scan_data_offset, entry, scan_number)
+        scan_data::decode_scan(&self.data, self.data_addr as usize, entry, scan_number)
     }
 
     /// Read multiple scans in parallel using rayon.
@@ -98,7 +159,7 @@ impl RawFile {
         entries
             .par_iter()
             .map(|(entry, scan_num)| {
-                scan_data::decode_scan(&self._data, self._scan_data_offset, entry, *scan_num)
+                scan_data::decode_scan(&self.data, self.data_addr as usize, entry, *scan_num)
             })
             .collect()
     }
@@ -157,4 +218,69 @@ impl RawFile {
             intensity: results.iter().map(|(_, int)| *int).collect(),
         })
     }
+
+    /// Get trailer extra data for a specific scan.
+    pub fn trailer_extra(
+        &mut self,
+        scan_number: u32,
+    ) -> Result<HashMap<String, String>, RawError> {
+        // Lazy-parse trailer header on first access
+        if self.trailer_header.is_none() && self.trailer_addr > 0 {
+            self.trailer_header =
+                Some(trailer::parse_generic_data_header(&self.data, self.trailer_addr)?);
+        }
+
+        let header = self
+            .trailer_header
+            .as_ref()
+            .ok_or_else(|| RawError::StreamNotFound("trailer extra".to_string()))?;
+
+        let scan_idx = scan_number
+            .checked_sub(self.run_header.first_scan)
+            .ok_or(RawError::ScanOutOfRange(scan_number))?;
+
+        trailer::parse_trailer_extra(&self.data, header, scan_idx)
+    }
+
+    /// Get the list of trailer extra field labels.
+    pub fn trailer_fields(&self) -> Result<Vec<String>, RawError> {
+        if self.trailer_addr == 0 {
+            return Ok(vec![]);
+        }
+        trailer::parse_trailer_fields(&self.data, self.trailer_addr)
+    }
+
+    /// Get the raw scan index entries.
+    pub fn scan_index(&self) -> &[ScanIndexEntry] {
+        &self.scan_index
+    }
+
+    /// List OLE2 streams in the file (uses cfb-reader).
+    pub fn list_streams(path: impl AsRef<Path>) -> Result<Vec<String>, RawError> {
+        let container = cfb_reader::Ole2Container::open(path)
+            .map_err(|e| RawError::CfbError(e.to_string()))?;
+        Ok(container.list_streams())
+    }
+}
+
+/// Search for the Finnigan magic (0xA101) in the file data.
+/// Returns the byte offset of the magic, or None if not found.
+fn find_finnigan_magic(data: &[u8]) -> Option<usize> {
+    let magic_le = 0xA101u16.to_le_bytes();
+    let search_limit = data.len().min(65536);
+
+    for i in 0..search_limit.saturating_sub(1) {
+        if data[i] == magic_le[0] && data[i + 1] == magic_le[1] {
+            // Verify: the signature string should follow at offset +2
+            // (18 UTF-16 chars = 36 bytes). Check for reasonable version
+            // at offset +54.
+            if i + 58 <= data.len() {
+                let ver = u32::from_le_bytes(data[i + 54..i + 58].try_into().ok()?);
+                if ver > 0 && ver <= 200 {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    None
 }

@@ -1,7 +1,7 @@
 use numpy::{IntoPyArray, PyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use thermo_raw::{MsLevel, RawFile as InnerRawFile};
+use ::thermo_raw::{MsLevel, RawFile as InnerRawFile};
 
 #[pyclass]
 struct RawFile {
@@ -79,6 +79,7 @@ impl RawFile {
     }
 
     /// XIC: return (rt_array, intensity_array) as numpy arrays.
+    #[pyo3(signature = (mz, ppm=None))]
     fn xic<'py>(
         &self,
         py: Python<'py>,
